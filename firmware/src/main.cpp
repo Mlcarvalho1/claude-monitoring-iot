@@ -29,7 +29,7 @@ Config cfg;
 const char* CONFIG_FILE = "/config.json";
 
 // ── State ────────────────────────────────────────────────────────────────────
-enum Screen { SCREEN_SESSION, SCREEN_WEEKLY, SCREEN_COUNT };
+enum Screen { SCREEN_SESSION, SCREEN_WEEKLY, SCREEN_IP, SCREEN_COUNT };
 Screen currentScreen = SCREEN_SESSION;
 
 float sessionPct   = 0;
@@ -37,6 +37,7 @@ String sessionReset = "--";
 float weeklyPct    = 0;
 String weeklyReset  = "--";
 bool  dataOk       = false;
+int   lastHttpCode = 0;
 
 unsigned long lastFetch = 0;
 unsigned long lastBtnNext = 0;
@@ -84,8 +85,18 @@ void lcdPrint(const char* line0, const char* line1) {
 
 void drawScreen() {
     char l0[17], l1[17];
+    if (currentScreen == SCREEN_IP) {
+        lcdPrint("Config:", WiFi.localIP().toString().c_str());
+        return;
+    }
     if (!dataOk) {
-        lcdPrint("Aguardando...", "");
+        if (lastHttpCode != 0) {
+            char err[17];
+            snprintf(err, sizeof(err), "HTTP %d", lastHttpCode);
+            lcdPrint("Erro API:", err);
+        } else {
+            lcdPrint("Aguardando...", "");
+        }
         return;
     }
     if (currentScreen == SCREEN_SESSION) {
@@ -115,6 +126,7 @@ void fetchUsage() {
 
     http.addHeader("Authorization", String("Bearer ") + cfg.api_token);
     int code = http.GET();
+    lastHttpCode = code;
     if (code == 200) {
         JsonDocument doc;
         if (!deserializeJson(doc, http.getString())) {
@@ -225,11 +237,18 @@ void setup() {
 
     lcdPrint("WiFi OK!", WiFi.localIP().toString().c_str());
     delay(1500);
+
+    server.on("/",     handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.begin();
+
     fetchUsage();
     drawScreen();
 }
 
 void loop() {
+    server.handleClient();
+
     unsigned long now = millis();
 
     // Poll

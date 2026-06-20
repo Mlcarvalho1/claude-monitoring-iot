@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -20,9 +22,177 @@ var (
 	claudeSessionKey string
 	claudeOrgID      string
 	apiBearerToken   string
+	extraCookies     string
 	pollTimeout      int
 	usageURL         string
 )
+
+// ── LibreLinkUp ───────────────────────────────────────────────────────────────
+
+var (
+	lluEmail    string
+	lluPassword string
+)
+
+var (
+	lluMu          sync.Mutex
+	lluCachedToken string
+	lluTokenExpiry time.Time
+	lluBase        = "https://api.libreview.io"
+)
+
+type lluLoginResp struct {
+	Status int `json:"status"`
+	Data   struct {
+		AuthTicket struct {
+			Token   string `json:"token"`
+			Expires int64  `json:"expires"`
+		} `json:"authTicket"`
+		Redirect bool   `json:"redirect"`
+		Region   string `json:"region"`
+	} `json:"data"`
+}
+
+type lluConnResp struct {
+	Status int `json:"status"`
+	Data   []struct {
+		GlucoseMeasurement struct {
+			Timestamp  string  `json:"Timestamp"`
+			Value      float64 `json:"Value"`
+			TrendArrow int     `json:"TrendArrow"`
+		} `json:"glucoseMeasurement"`
+	} `json:"data"`
+}
+
+type GlucoseResponse struct {
+	Value      float64 `json:"value"`
+	TrendIcon  string  `json:"trend_icon"`
+	MinutesAgo int     `json:"minutes_ago"`
+	Low        bool    `json:"low"`
+	High       bool    `json:"high"`
+}
+
+func lluSetHeaders(req *http.Request, token string) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("product", "llu.ios")
+	req.Header.Set("version", "4.7.0")
+	req.Header.Set("User-Agent", "FreeStyle LibreLink Up/4.7.0 CFNetwork/1408.0.4 Darwin/22.5.0")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
+func lluDoLogin(base string) error {
+	body, _ := json.Marshal(map[string]string{"email": lluEmail, "password": lluPassword})
+	req, err := http.NewRequest(http.MethodPost, base+"/llu/auth/login", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	lluSetHeaders(req, "")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var lr lluLoginResp
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return fmt.Errorf("LLU login decode: %w", err)
+	}
+
+	// API pode redirecionar para região específica (ex: api-eu.libreview.io)
+	if lr.Data.Redirect && lr.Data.Region != "" {
+		lluBase = "https://api-" + lr.Data.Region + ".libreview.io"
+		return lluDoLogin(lluBase)
+	}
+
+	if lr.Data.AuthTicket.Token == "" {
+		return fmt.Errorf("LLU login falhou: status %d", lr.Status)
+	}
+
+	lluCachedToken = lr.Data.AuthTicket.Token
+	lluTokenExpiry = time.Unix(lr.Data.AuthTicket.Expires, 0).Add(-5 * time.Minute)
+	return nil
+}
+
+func lluGetToken() (string, error) {
+	lluMu.Lock()
+	defer lluMu.Unlock()
+	if lluCachedToken != "" && time.Now().Before(lluTokenExpiry) {
+		return lluCachedToken, nil
+	}
+	if err := lluDoLogin(lluBase); err != nil {
+		return "", err
+	}
+	return lluCachedToken, nil
+}
+
+func lluFetchGlucose() (*GlucoseResponse, error) {
+	token, err := lluGetToken()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, lluBase+"/llu/connections", nil)
+	if err != nil {
+		return nil, err
+	}
+	lluSetHeaders(req, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Token expirado — força re-login na próxima chamada
+	if resp.StatusCode == http.StatusUnauthorized {
+		lluMu.Lock()
+		lluCachedToken = ""
+		lluMu.Unlock()
+		return nil, fmt.Errorf("token expirado, tente novamente")
+	}
+
+	var cr lluConnResp
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return nil, fmt.Errorf("LLU connections decode: %w", err)
+	}
+	if len(cr.Data) == 0 {
+		return nil, fmt.Errorf("nenhuma leitura disponível")
+	}
+
+	gm := cr.Data[0].GlucoseMeasurement
+
+	// Tenta múltiplos formatos de timestamp que a API retorna
+	var t time.Time
+	for _, layout := range []string{"1/2/2006 3:04:05 PM", "1/2/2006 15:04:05", "2006-01-02T15:04:05"} {
+		if parsed, err := time.ParseInLocation(layout, gm.Timestamp, time.UTC); err == nil {
+			t = parsed
+			break
+		}
+	}
+	minutesAgo := 0
+	if !t.IsZero() {
+		minutesAgo = int(time.Since(t).Minutes())
+	}
+
+	icons := map[int]string{1: "vv", 2: "v", 3: "->", 4: "^", 5: "^^"}
+	icon := icons[gm.TrendArrow]
+	if icon == "" {
+		icon = "->"
+	}
+
+	return &GlucoseResponse{
+		Value:      gm.Value,
+		TrendIcon:  icon,
+		MinutesAgo: minutesAgo,
+		Low:        gm.Value < 70,
+		High:       gm.Value > 180,
+	}, nil
+}
 
 type UsageResponse struct {
 	SessionPct      float64 `json:"session_pct"`
@@ -75,7 +245,7 @@ func formatResetsAt(iso string) string {
 func newTLSClient() (tls_client.HttpClient, error) {
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(pollTimeout),
-		tls_client.WithClientProfile(profiles.Chrome_120),
+		tls_client.WithClientProfile(profiles.Chrome_131),
 	}
 	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 }
@@ -90,13 +260,25 @@ func fetchClaude() (*claudeResp, int, []byte, error) {
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	// Header order matches Chrome 131 fetch() — Cloudflare inspects ordering
+	req.Header.Set("sec-ch-ua", `"Google Chrome";v="131", "Chromium";v="131", "Not-A.Brand";v="24"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	req.Header.Set("accept", "*/*")
 	req.Header.Set("accept-language", "en-US,en;q=0.9")
 	req.Header.Set("anthropic-client-platform", "web_claude_ai")
 	req.Header.Set("anthropic-client-version", "1.0.0")
-	req.Header.Set("content-type", "application/json")
 	req.Header.Set("referer", "https://claude.ai/settings")
-	req.Header.Set("Cookie", "sessionKey="+claudeSessionKey)
+	req.Header.Set("sec-fetch-site", "same-origin")
+	req.Header.Set("sec-fetch-mode", "cors")
+	req.Header.Set("sec-fetch-dest", "empty")
+	req.Header.Set("priority", "u=1, i")
+	cookie := "sessionKey=" + claudeSessionKey
+	if extraCookies != "" {
+		cookie += "; " + extraCookies
+	}
+	req.Header.Set("Cookie", cookie)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -186,6 +368,19 @@ func handleUsage(w http.ResponseWriter, _ *http.Request) {
 	jsonWrite(w, http.StatusOK, out)
 }
 
+func handleGlucose(w http.ResponseWriter, _ *http.Request) {
+	if lluEmail == "" || lluPassword == "" {
+		jsonError(w, http.StatusNotImplemented, "LLU_EMAIL / LLU_PASSWORD não configurados")
+		return
+	}
+	gr, err := lluFetchGlucose()
+	if err != nil {
+		jsonError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, gr)
+}
+
 func handleDebug(w http.ResponseWriter, _ *http.Request) {
 	_, status, body, err := fetchClaude()
 	if err != nil {
@@ -221,6 +416,9 @@ func main() {
 	claudeSessionKey = mustEnv("CLAUDE_SESSION_KEY")
 	claudeOrgID = mustEnv("CLAUDE_ORG_ID")
 	apiBearerToken = mustEnv("API_BEARER_TOKEN")
+	extraCookies = os.Getenv("EXTRA_COOKIES")
+	lluEmail = os.Getenv("LLU_EMAIL")
+	lluPassword = os.Getenv("LLU_PASSWORD")
 
 	pollTimeout = 10
 	if s := os.Getenv("POLL_TIMEOUT"); s != "" {
@@ -234,6 +432,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /usage", bearer(handleUsage))
+	mux.HandleFunc("GET /glucose", bearer(handleGlucose))
 	mux.HandleFunc("GET /debug", bearer(handleDebug))
 
 	log.Println("claude-monitor API listening on :8080")
