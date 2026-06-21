@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,15 +34,17 @@ var (
 // ── LibreLinkUp ───────────────────────────────────────────────────────────────
 
 var (
-	lluEmail    string
-	lluPassword string
+	lluEmail     string
+	lluPassword  string
+	lluPatientID string
 )
 
 var (
-	lluMu          sync.Mutex
-	lluCachedToken string
-	lluTokenExpiry time.Time
-	lluBase        = "https://api.libreview.io"
+	lluMu            sync.Mutex
+	lluCachedToken   string
+	lluTokenExpiry   time.Time
+	lluCachedAccount string
+	lluBase          = "https://api.libreview.io"
 )
 
 type lluLoginResp struct {
@@ -48,39 +54,105 @@ type lluLoginResp struct {
 			Token   string `json:"token"`
 			Expires int64  `json:"expires"`
 		} `json:"authTicket"`
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
 		Redirect bool   `json:"redirect"`
 		Region   string `json:"region"`
 	} `json:"data"`
 }
 
-type lluConnResp struct {
+type lluGraphPoint struct {
+	FactoryTimestamp string  `json:"FactoryTimestamp"`
+	Timestamp        string  `json:"Timestamp"`
+	Value            float64 `json:"Value"`
+}
+
+type lluConnection struct {
+	PatientID          string `json:"patientId"`
+	GlucoseMeasurement struct {
+		FactoryTimestamp string  `json:"FactoryTimestamp"`
+		Timestamp        string  `json:"Timestamp"`
+		Value            float64 `json:"Value"`
+		TrendArrow       int     `json:"TrendArrow"`
+	} `json:"glucoseMeasurement"`
+}
+
+// lluGraphResp é a resposta de GET /llu/connections/{patientId}/graph,
+// que traz o histórico de leituras (a conexão isolada não traz graphData).
+type lluGraphResp struct {
 	Status int `json:"status"`
-	Data   []struct {
-		GlucoseMeasurement struct {
-			Timestamp  string  `json:"Timestamp"`
-			Value      float64 `json:"Value"`
-			TrendArrow int     `json:"TrendArrow"`
-		} `json:"glucoseMeasurement"`
+	Data   struct {
+		GraphData []lluGraphPoint `json:"graphData"`
 	} `json:"data"`
 }
 
-type GlucoseResponse struct {
-	Value      float64 `json:"value"`
-	TrendIcon  string  `json:"trend_icon"`
-	MinutesAgo int     `json:"minutes_ago"`
-	Low        bool    `json:"low"`
-	High       bool    `json:"high"`
+// lluTimeLayouts são os formatos de timestamp observados na LibreLinkUp API.
+var lluTimeLayouts = []string{"1/2/2006 3:04:05 PM", "1/2/2006 15:04:05", "2006-01-02T15:04:05"}
+
+// parseLLUTimestamp prefere factoryTimestamp (sempre UTC); timestamp costuma
+// vir no fuso local do leitor e só é usado como fallback.
+func parseLLUTimestamp(factoryTimestamp, timestamp string) time.Time {
+	raw := factoryTimestamp
+	if raw == "" {
+		raw = timestamp
+	}
+	for _, layout := range lluTimeLayouts {
+		if t, err := time.ParseInLocation(layout, raw, time.UTC); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
-func lluSetHeaders(req *http.Request, token string) {
+type lluConnResp struct {
+	Status int             `json:"status"`
+	Data   json.RawMessage `json:"data"`
+}
+
+// parseConnections decodifica lluConnResp.Data, que a LibreLinkUp API retorna
+// como array quando a conta segue múltiplos pacientes, ou como objeto único
+// quando segue apenas um.
+func parseConnections(raw json.RawMessage) ([]lluConnection, error) {
+	var list []lluConnection
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list, nil
+	}
+	var single lluConnection
+	if err := json.Unmarshal(raw, &single); err != nil {
+		return nil, fmt.Errorf("LLU connections decode: %w", err)
+	}
+	return []lluConnection{single}, nil
+}
+
+type GlucoseHistoryPoint struct {
+	MinutesAgo int     `json:"m"`
+	Value      float64 `json:"v"`
+}
+
+type GlucoseResponse struct {
+	Value      float64               `json:"value"`
+	TrendIcon  string                `json:"trend_icon"`
+	MinutesAgo int                   `json:"minutes_ago"`
+	Low        bool                  `json:"low"`
+	High       bool                  `json:"high"`
+	History    []GlucoseHistoryPoint `json:"history"`
+}
+
+const glucoseHistoryWindowMin = 6 * 60
+
+func lluSetHeaders(req *http.Request, token, accountIDHash string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("product", "llu.ios")
-	req.Header.Set("version", "4.7.0")
-	req.Header.Set("User-Agent", "FreeStyle LibreLink Up/4.7.0 CFNetwork/1408.0.4 Darwin/22.5.0")
+	req.Header.Set("version", "4.16.0")
+	req.Header.Set("User-Agent", "FreeStyle LibreLink Up/4.16.0 CFNetwork/1408.0.4 Darwin/22.5.0")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Cache-Control", "no-cache")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if accountIDHash != "" {
+		req.Header.Set("Account-Id", accountIDHash)
 	}
 }
 
@@ -90,7 +162,7 @@ func lluDoLogin(base string) error {
 	if err != nil {
 		return err
 	}
-	lluSetHeaders(req, "")
+	lluSetHeaders(req, "", "")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -115,36 +187,41 @@ func lluDoLogin(base string) error {
 
 	lluCachedToken = lr.Data.AuthTicket.Token
 	lluTokenExpiry = time.Unix(lr.Data.AuthTicket.Expires, 0).Add(-5 * time.Minute)
+	// A API exige o header Account-Id = sha256(user.id) em todas as chamadas autenticadas.
+	sum := sha256.Sum256([]byte(lr.Data.User.ID))
+	lluCachedAccount = hex.EncodeToString(sum[:])
 	return nil
 }
 
-func lluGetToken() (string, error) {
+func lluGetToken() (token, accountIDHash string, err error) {
 	lluMu.Lock()
 	defer lluMu.Unlock()
 	if lluCachedToken != "" && time.Now().Before(lluTokenExpiry) {
-		return lluCachedToken, nil
+		return lluCachedToken, lluCachedAccount, nil
 	}
 	if err := lluDoLogin(lluBase); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return lluCachedToken, nil
+	return lluCachedToken, lluCachedAccount, nil
 }
 
-func lluFetchGlucose() (*GlucoseResponse, error) {
-	token, err := lluGetToken()
+// lluFetchConnectionsRaw faz a chamada a /llu/connections e devolve status + corpo crú,
+// sem decodificar — usado tanto pelo fluxo normal quanto pelo endpoint de debug.
+func lluFetchConnectionsRaw() (int, []byte, error) {
+	token, accountIDHash, err := lluGetToken()
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
 	req, err := http.NewRequest(http.MethodGet, lluBase+"/llu/connections", nil)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	lluSetHeaders(req, token)
+	lluSetHeaders(req, token, accountIDHash)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 
@@ -153,27 +230,100 @@ func lluFetchGlucose() (*GlucoseResponse, error) {
 		lluMu.Lock()
 		lluCachedToken = ""
 		lluMu.Unlock()
-		return nil, fmt.Errorf("token expirado, tente novamente")
+		return resp.StatusCode, nil, fmt.Errorf("token expirado, tente novamente")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, err
+}
+
+// lluFetchGraph busca o histórico de leituras do paciente em
+// GET /llu/connections/{patientId}/graph.
+func lluFetchGraph(patientID string) ([]lluGraphPoint, error) {
+	token, accountIDHash, err := lluGetToken()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, lluBase+"/llu/connections/"+patientID+"/graph", nil)
+	if err != nil {
+		return nil, err
+	}
+	lluSetHeaders(req, token, accountIDHash)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		snippet := string(body)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return nil, fmt.Errorf("LLU graph retornou status %d: %s", resp.StatusCode, snippet)
+	}
+
+	var gr lluGraphResp
+	if err := json.Unmarshal(body, &gr); err != nil {
+		return nil, fmt.Errorf("LLU graph decode: %w", err)
+	}
+	return gr.Data.GraphData, nil
+}
+
+func lluFetchGlucose() (*GlucoseResponse, error) {
+	status, body, err := lluFetchConnectionsRaw()
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		snippet := string(body)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return nil, fmt.Errorf("LLU connections retornou status %d: %s", status, snippet)
 	}
 
 	var cr lluConnResp
-	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+	if err := json.Unmarshal(body, &cr); err != nil {
 		return nil, fmt.Errorf("LLU connections decode: %w", err)
 	}
-	if len(cr.Data) == 0 {
+
+	connections, err := parseConnections(cr.Data)
+	if err != nil {
+		return nil, err
+	}
+	if len(connections) == 0 {
 		return nil, fmt.Errorf("nenhuma leitura disponível")
 	}
 
-	gm := cr.Data[0].GlucoseMeasurement
-
-	// Tenta múltiplos formatos de timestamp que a API retorna
-	var t time.Time
-	for _, layout := range []string{"1/2/2006 3:04:05 PM", "1/2/2006 15:04:05", "2006-01-02T15:04:05"} {
-		if parsed, err := time.ParseInLocation(layout, gm.Timestamp, time.UTC); err == nil {
-			t = parsed
-			break
+	conn := connections[0]
+	if len(connections) > 1 {
+		// Só exige correspondência exata quando há ambiguidade real.
+		if lluPatientID == "" {
+			return nil, fmt.Errorf("conta LibreLinkUp segue %d pacientes — defina LLU_PATIENT_ID para escolher qual", len(connections))
+		}
+		found := false
+		for _, c := range connections {
+			if c.PatientID == lluPatientID {
+				conn = c
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("LLU_PATIENT_ID %q não encontrado entre %d conexões", lluPatientID, len(connections))
 		}
 	}
+
+	gm := conn.GlucoseMeasurement
+
+	t := parseLLUTimestamp(gm.FactoryTimestamp, gm.Timestamp)
 	minutesAgo := 0
 	if !t.IsZero() {
 		minutesAgo = int(time.Since(t).Minutes())
@@ -185,12 +335,35 @@ func lluFetchGlucose() (*GlucoseResponse, error) {
 		icon = "->"
 	}
 
+	// Histórico vem de um endpoint separado — se falhar, devolve a leitura
+	// atual mesmo assim (history vazio) em vez de quebrar a rota inteira.
+	graphPoints, err := lluFetchGraph(conn.PatientID)
+	if err != nil {
+		log.Printf("LLU graph fetch falhou: %v", err)
+		graphPoints = nil
+	}
+
+	history := make([]GlucoseHistoryPoint, 0, len(graphPoints))
+	for _, p := range graphPoints {
+		pt := parseLLUTimestamp(p.FactoryTimestamp, p.Timestamp)
+		if pt.IsZero() {
+			continue
+		}
+		m := int(time.Since(pt).Minutes())
+		if m < 0 || m > glucoseHistoryWindowMin {
+			continue
+		}
+		history = append(history, GlucoseHistoryPoint{MinutesAgo: m, Value: p.Value})
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].MinutesAgo > history[j].MinutesAgo })
+
 	return &GlucoseResponse{
 		Value:      gm.Value,
 		TrendIcon:  icon,
 		MinutesAgo: minutesAgo,
 		Low:        gm.Value < 70,
 		High:       gm.Value > 180,
+		History:    history,
 	}, nil
 }
 
@@ -306,7 +479,8 @@ func fetchClaude() (*claudeResp, int, []byte, error) {
 func bearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != apiBearerToken {
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(token), []byte(apiBearerToken)) != 1 {
 			jsonError(w, http.StatusUnauthorized, "Invalid token")
 			return
 		}
@@ -381,6 +555,26 @@ func handleGlucose(w http.ResponseWriter, _ *http.Request) {
 	jsonWrite(w, http.StatusOK, gr)
 }
 
+func handleGlucoseDebug(w http.ResponseWriter, _ *http.Request) {
+	if lluEmail == "" || lluPassword == "" {
+		jsonError(w, http.StatusNotImplemented, "LLU_EMAIL / LLU_PASSWORD não configurados")
+		return
+	}
+	status, body, err := lluFetchConnectionsRaw()
+	if err != nil {
+		jsonError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	var parsed any
+	if json.Unmarshal(body, &parsed) != nil {
+		parsed = string(body)
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"status": status,
+		"body":   parsed,
+	})
+}
+
 func handleDebug(w http.ResponseWriter, _ *http.Request) {
 	_, status, body, err := fetchClaude()
 	if err != nil {
@@ -419,6 +613,7 @@ func main() {
 	extraCookies = os.Getenv("EXTRA_COOKIES")
 	lluEmail = os.Getenv("LLU_EMAIL")
 	lluPassword = os.Getenv("LLU_PASSWORD")
+	lluPatientID = os.Getenv("LLU_PATIENT_ID")
 
 	pollTimeout = 10
 	if s := os.Getenv("POLL_TIMEOUT"); s != "" {
@@ -433,6 +628,7 @@ func main() {
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /usage", bearer(handleUsage))
 	mux.HandleFunc("GET /glucose", bearer(handleGlucose))
+	mux.HandleFunc("GET /glucose/debug", bearer(handleGlucoseDebug))
 	mux.HandleFunc("GET /debug", bearer(handleDebug))
 
 	log.Println("claude-monitor API listening on :8080")

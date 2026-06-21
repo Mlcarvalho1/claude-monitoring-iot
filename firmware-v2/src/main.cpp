@@ -54,6 +54,11 @@ bool   glucoseOk    = false;
 unsigned long lastGlucoseFetch = 0;
 const unsigned long GLUCOSE_INTERVAL_MS = 5UL * 60UL * 1000UL; // 5 minutos
 
+#define GLUCOSE_HISTORY_MAX 80
+float histVal[GLUCOSE_HISTORY_MAX];
+int   histMin[GLUCOSE_HISTORY_MAX]; // minutos atrás, decrescente (mais antigo primeiro)
+int   histCount = 0;
+
 unsigned long lastFetch   = 0;
 unsigned long lastBtnNext = 0;
 unsigned long lastBtnPrev = 0;
@@ -113,6 +118,43 @@ void drawBar(int pct, int y, int h = 8) {
     if (fill > 0) display.drawBox(1, y + 1, fill, h - 2);
 }
 
+// ── Gráfico de glicose (últimas 6h) ────────────────────────────────────────────
+const int   GRAPH_X0 = 0, GRAPH_X1 = 127;
+const int   GRAPH_Y0 = 24, GRAPH_Y1 = 63;
+const int   GRAPH_WINDOW_MIN = 6 * 60;
+const float GRAPH_MIN_MGDL = 40.0f, GRAPH_MAX_MGDL = 300.0f;
+
+int graphX(int minutesAgo) {
+    int m = constrain(minutesAgo, 0, GRAPH_WINDOW_MIN);
+    return GRAPH_X0 + (int)((float)(GRAPH_WINDOW_MIN - m) / GRAPH_WINDOW_MIN * (GRAPH_X1 - GRAPH_X0));
+}
+
+int graphY(float value) {
+    float v = constrain(value, GRAPH_MIN_MGDL, GRAPH_MAX_MGDL);
+    float frac = (v - GRAPH_MIN_MGDL) / (GRAPH_MAX_MGDL - GRAPH_MIN_MGDL);
+    return GRAPH_Y1 - (int)(frac * (GRAPH_Y1 - GRAPH_Y0));
+}
+
+void drawDottedHLine(int y) {
+    for (int x = GRAPH_X0; x <= GRAPH_X1; x += 3) display.drawPixel(x, y);
+}
+
+void drawGlucoseGraph() {
+    // linhas de referência da faixa alvo (70 e 180 mg/dL)
+    drawDottedHLine(graphY(70));
+    drawDottedHLine(graphY(180));
+
+    for (int i = 0; i < histCount - 1; i++) {
+        display.drawLine(graphX(histMin[i]),   graphY(histVal[i]),
+                          graphX(histMin[i+1]), graphY(histVal[i+1]));
+    }
+
+    // ponto atual em destaque, à direita
+    int cx = graphX(0);
+    int cy = graphY(glucoseVal);
+    display.drawBox(cx - 1, cy - 1, 3, 3);
+}
+
 void drawScreen() {
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tf);
@@ -124,31 +166,18 @@ void drawScreen() {
             display.sendBuffer();
             return;
         }
-        char valStr[16];
-        snprintf(valStr, sizeof(valStr), "%.0f %s", glucoseVal, glucoseTrend.c_str());
-        display.drawStr(0, 10, "Glicose mg/dL");
-        display.setFont(u8g2_font_ncenB14_tr);
-        display.drawStr(0, 32, valStr);
-        display.setFont(u8g2_font_6x10_tf);
 
-        // Barra de range (verde 70-180, vermelho fora)
-        display.drawFrame(0, 38, 128, 8);
-        // faixa normal (70-180) em destaque
-        int lo = 128 * 70 / 400;
-        int hi = 128 * 180 / 400;
-        display.drawBox(lo, 39, hi - lo, 6);   // zona alvo
-        // posição atual
-        int pos = constrain((int)(128 * glucoseVal / 400), 0, 127);
-        display.setDrawColor(0);
-        display.drawBox(pos - 1, 38, 3, 8);
-        display.setDrawColor(1);
-        display.drawVLine(pos, 38, 8);
+        char header[24];
+        snprintf(header, sizeof(header), "%.0f mg/dL  %s", glucoseVal, glucoseTrend.c_str());
+        display.drawStr(0, 9, header);
 
-        char minStr[24];
-        if (glucoseLow)       snprintf(minStr, sizeof(minStr), "BAIXO  ha %d min", glucoseMin);
-        else if (glucoseHigh) snprintf(minStr, sizeof(minStr), "ALTO   ha %d min", glucoseMin);
-        else                  snprintf(minStr, sizeof(minStr), "Normal  ha %d min", glucoseMin);
-        display.drawStr(0, 56, minStr);
+        char status[24];
+        if (glucoseLow)       snprintf(status, sizeof(status), "BAIXO   ha %d min", glucoseMin);
+        else if (glucoseHigh) snprintf(status, sizeof(status), "ALTO    ha %d min", glucoseMin);
+        else                  snprintf(status, sizeof(status), "Normal  ha %d min", glucoseMin);
+        display.drawStr(0, 20, status);
+
+        drawGlucoseGraph();
         display.sendBuffer();
         return;
     }
@@ -231,6 +260,14 @@ void fetchGlucose() {
             glucoseLow   = doc["low"]         | false;
             glucoseHigh  = doc["high"]        | false;
             glucoseOk    = true;
+
+            histCount = 0;
+            for (JsonObject pt : doc["history"].as<JsonArray>()) {
+                if (histCount >= GLUCOSE_HISTORY_MAX) break;
+                histMin[histCount] = pt["m"] | 0;
+                histVal[histCount] = pt["v"] | 0.0f;
+                histCount++;
+            }
         }
     }
     http.end();
